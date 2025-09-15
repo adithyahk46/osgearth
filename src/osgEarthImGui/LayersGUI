@@ -58,6 +58,52 @@
 #include <osgEarthProcedural/BridgeLayer>
 #endif
 
+
+const char* coverage_render_shader = R"(
+#version 460
+#pragma vp_function oeui_render_coverage, fragment
+const vec3 colors[32] = { // thanks, GPT
+    vec3(1.0, 0.0, 0.0),   // Red
+    vec3(0.0, 1.0, 0.0),   // Green
+    vec3(0.0, 0.0, 1.0),   // Blue
+    vec3(1.0, 1.0, 0.0),   // Yellow
+    vec3(1.0, 0.0, 1.0),   // Magenta
+    vec3(0.0, 1.0, 1.0),   // Cyan
+    vec3(1.0, 0.5, 0.0),   // Orange
+    vec3(0.5, 1.0, 0.0),   // Lime
+    vec3(0.0, 0.5, 1.0),   // Sky Blue
+    vec3(0.5, 0.0, 1.0),   // Purple
+    vec3(1.0, 0.5, 0.5),   // Light Red
+    vec3(0.5, 1.0, 0.5),   // Light Green
+    vec3(0.5, 0.5, 1.0),   // Light Blue
+    vec3(1.0, 1.0, 0.5),   // Light Yellow
+    vec3(1.0, 0.5, 1.0),   // Light Magenta
+    vec3(0.5, 1.0, 1.0),   // Light Cyan
+    vec3(0.8, 0.2, 0.2),   // Dark Red
+    vec3(0.2, 0.8, 0.2),   // Dark Green
+    vec3(0.2, 0.2, 0.8),   // Dark Blue
+    vec3(0.8, 0.8, 0.2),   // Dark Yellow
+    vec3(0.8, 0.2, 0.8),   // Dark Magenta
+    vec3(0.2, 0.8, 0.8),   // Dark Cyan
+    vec3(0.8, 0.5, 0.2),   // Brown
+    vec3(0.5, 0.8, 0.2),   // Olive Green
+    vec3(0.2, 0.5, 0.8),   // Steel Blue
+    vec3(0.5, 0.2, 0.8),   // Indigo
+    vec3(0.8, 0.5, 0.5),   // Salmon
+    vec3(0.5, 0.8, 0.5),   // Light Olive Green
+    vec3(0.5, 0.5, 0.8),   // Cornflower Blue
+    vec3(0.8, 0.8, 0.5),   // Light Khaki
+    vec3(0.8, 0.5, 0.8),   // Orchid
+    vec3(0.5, 0.8, 0.8)    // Light Slate Gray
+};
+void oeui_render_coverage(inout vec4 color) {
+    int cv = int(color.r * 255.0);
+    if (cv == 0) discard;
+    color.rgb = colors[(cv-1) % 32];
+    color.a = 1.0;
+}
+)";
+
 namespace osgEarth
 {
     using namespace osgEarth::Contrib;
@@ -919,6 +965,40 @@ namespace osgEarth
                         auto coverage = dynamic_cast<osgEarth::CoverageLayer*>(layer);
                         if (coverage)
                         {
+                            static bool showCoverageComponentLayers = false;
+                            static std::map<UID, optional<bool>> coverageComponentLayers;
+
+                            showCoverageComponentLayers = ImGui::TreeNodeEx("Component Layers");
+                            if (showCoverageComponentLayers)
+                            {
+                                for (auto& cl : coverage->options().layers())
+                                {
+                                    auto source = cl.source().getLayer();
+                                    ImGui::PushID(source->getUID());
+                                    if (source->isOpen())
+                                    {
+                                        auto& show = coverageComponentLayers[source->getUID()];
+
+                                        if (!show.isSet())
+                                        {
+                                            show = false;
+                                            ShaderLoader::load(VirtualProgram::getOrCreate(source->getOrCreateStateSet()), coverage_render_shader);
+                                            map->addLayer(source);
+                                            source->setVisible(false);
+                                            source->options().minFilter() = osg::Texture::NEAREST;
+                                            source->options().magFilter() = osg::Texture::NEAREST;
+                                        }
+
+                                        if (ImGui::Checkbox(source->getName().c_str(), &show.mutable_value()))
+                                        {
+                                            source->setVisible(show.value());
+                                        }
+                                    }
+                                    ImGui::PopID();
+                                }
+                                ImGui::TreePop();
+                            }
+
                             bool queryOn = (_mouseOverCoverageLayer == coverage);
 
                             if (ImGui::Checkbox("Show value under mouse", &queryOn))
@@ -933,6 +1013,9 @@ namespace osgEarth
                                     if (_coverageLayerValueUnderMouse->isOK())
                                     {
                                         auto& value = _coverageLayerValueUnderMouse->value();
+                                        auto json = value.getConfig().toJSON(true);
+                                        ImGui::TextWrapped("%s", json.c_str());
+#if 0
                                         if (value.biomeid().isSet())
                                             ImGui::Text("Biome ID: %s", value.biomeid()->c_str());
                                         if (value.dense().isSet())
@@ -943,6 +1026,7 @@ namespace osgEarth
                                             ImGui::Text("Rugged: %.2f", value.rugged().value());    
                                         if (value.soiltype().isSet())
                                             ImGui::Text("Soil Type: %s", value.soiltype()->c_str());
+#endif
                                     }
                                     else
                                     {
@@ -1366,17 +1450,21 @@ namespace osgEarth
                                 osg::ref_ptr<ProgressCallback> prog = new ProgressCallback(&c);
 
                                 auto factory = osgEarth::Procedural::LandCoverSample::Factory::create(_mouseOverCoverageLayer);
-                                const osgEarth::Procedural::LandCoverSample* value = nullptr;
-                                for(TileKey key2 = key; !value && key2.valid(); key2.makeParent()) {
+                                osgEarth::Procedural::LandCoverSample value;
+                                for(TileKey key2 = key; !value.valid() && key2.valid(); key2.makeParent()) {
                                     auto coverage = factory->createCoverage(key2, prog.get());
                                     if (coverage.valid())
-                                        value = coverage.readAtCoords(p.x(), p.y());
-                                    else
-                                        break;
+                                    {
+                                        auto pc = p.transform(coverage.getExtent().getSRS());
+                                        auto ptr = coverage.readAtCoords(pc.x(), pc.y());
+                                        if (ptr)
+                                            value = *ptr;
+                                    }
+                                    else break;
                                 }
-                                if (value)
+                                if (value.valid())
                                 {
-                                    return Result<osgEarth::Procedural::LandCoverSample>(*value);
+                                    return Result<osgEarth::Procedural::LandCoverSample>(value);
                                 }
                                 return Result<osgEarth::Procedural::LandCoverSample>(Status::Error("No value"));
                             };
